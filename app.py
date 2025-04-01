@@ -17,7 +17,9 @@ import os
 from dotenv import load_dotenv
 load_dotenv()
 
-os.environ['HF_TOKEN']="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"
+set HF_TOKEN="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"
+
+# os.environ['HF_TOKEN']= 
 embeddings=HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 # embeddings = OpenAIEmbeddings()
 
