@@ -26,11 +26,11 @@ openai_api_key = os.getenv("OPENAI_API_KEY")
 pinecone_api_key = os.getenv("PINECONE_API_KEY")
 
 if not openai_api_key:
-    st.error("❌ OPENAI_API_KEY not found in .env or Streamlit secrets")
+    st.error("❌ OPENAI_API_KEY not found in environment / Streamlit secrets")
     st.stop()
 
 if not pinecone_api_key:
-    st.error("❌ PINECONE_API_KEY not found in .env or Streamlit secrets")
+    st.error("❌ PINECONE_API_KEY not found in environment / Streamlit secrets")
     st.stop()
 
 
@@ -66,16 +66,15 @@ with st.sidebar:
         if session_id in st.session_state.store:
             st.session_state.store[session_id].clear()
         st.rerun()
-
     if st.session_state.vectorstore:
-        st.caption("📊 Using Pinecone index: chatwithpdf")
+        st.caption("📊 Using Pinecone index: chatwithpdf-1536")
 
 # ── PDF Upload ───────────────────────────────────────────────────────────
 uploaded_files = st.file_uploader(
     "Upload PDF(s)",
     type="pdf",
     accept_multiple_files=True,
-    help="Files will be added to your Pinecone index 'chatwithpdf'",
+    help="Files will be added to your Pinecone index 'chatwithpdf-1536'",
 )
 
 INDEX_NAME = "chatwithpdf-1536"
@@ -88,7 +87,6 @@ if uploaded_files:
             temp_path = f"./temp_{file.name}"
             with open(temp_path, "wb") as f:
                 f.write(file.getvalue())
-
             try:
                 loader = PyPDFLoader(temp_path)
                 docs = loader.load()
@@ -126,7 +124,7 @@ if uploaded_files:
         else:
             status.update(label="No new documents to process", state="complete")
 
-# ── Connect to existing Pinecone index if not loaded yet ─────────────────
+# ── Connect to existing Pinecone index ──────────────────────────────────
 if st.session_state.vectorstore is None:
     with st.spinner("Connecting to existing Pinecone index..."):
         try:
@@ -139,23 +137,26 @@ if st.session_state.vectorstore is None:
             st.error(f"Could not connect to Pinecone index: {str(e)}")
             st.stop()
 
-# ── RAG chain ────────────────────────────────────────────────────────────
-retriever = None
-conversational_rag_chain = None
+# ── Build RAG chain ──────────────────────────────────────────────────────
+# NOTE: MessagesPlaceholder(variable_name="chat_history") is mandatory here.
+# Using a plain ("role", "{chat_history}") tuple causes the variable to resolve
+# to None under langchain-core >= 0.3 + pydantic v2, crashing
+# create_stuff_documents_chain with a NoneType TypeError.
 
-if st.session_state.vectorstore:
-    retriever = st.session_state.vectorstore.as_retriever(search_kwargs={"k": 6})
+@st.cache_resource(show_spinner="Building RAG chain...")
+def build_rag_chain(_vectorstore):
+    retriever = _vectorstore.as_retriever(search_kwargs={"k": 6})
 
-    # FIX: Use MessagesPlaceholder instead of ("user", "{chat_history}") tuple.
-    # The tuple form passes the raw history object as a string which resolves to
-    # None under newer LangChain / Pydantic versions, crashing create_stuff_documents_chain.
     contextualize_q_prompt = ChatPromptTemplate.from_messages([
         (
             "system",
-            "Given a chat history and the latest user question, formulate a standalone "
-            "question that can be understood without the chat history. Do NOT answer it.",
+            (
+                "Given a chat history and the latest user question, "
+                "formulate a standalone question that can be understood "
+                "without the chat history. Do NOT answer it."
+            ),
         ),
-        MessagesPlaceholder("chat_history"),  # ← fixed
+        MessagesPlaceholder(variable_name="chat_history"),
         ("human", "{input}"),
     ])
 
@@ -172,25 +173,36 @@ if st.session_state.vectorstore:
 
     qa_prompt = ChatPromptTemplate.from_messages([
         ("system", system_prompt),
-        MessagesPlaceholder("chat_history"),  # ← fixed
+        MessagesPlaceholder(variable_name="chat_history"),
         ("human", "{input}"),
     ])
 
     question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
     rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
+    return rag_chain
 
-    def get_session_history(session: str) -> BaseChatMessageHistory:
-        if session not in st.session_state.store:
-            st.session_state.store[session] = ChatMessageHistory()
-        return st.session_state.store[session]
 
-    conversational_rag_chain = RunnableWithMessageHistory(
-        rag_chain,
-        get_session_history,
-        input_messages_key="input",
-        history_messages_key="chat_history",
-        output_messages_key="answer",
-    )
+def get_session_history(session: str) -> BaseChatMessageHistory:
+    if session not in st.session_state.store:
+        st.session_state.store[session] = ChatMessageHistory()
+    return st.session_state.store[session]
+
+
+conversational_rag_chain = None
+
+if st.session_state.vectorstore is not None:
+    try:
+        rag_chain = build_rag_chain(st.session_state.vectorstore)
+        conversational_rag_chain = RunnableWithMessageHistory(
+            rag_chain,
+            get_session_history,
+            input_messages_key="input",
+            history_messages_key="chat_history",
+            output_messages_key="answer",
+        )
+    except Exception as e:
+        st.error(f"Failed to build RAG chain: {str(e)}")
+        st.stop()
 
 # ── Chat interface ───────────────────────────────────────────────────────
 if conversational_rag_chain is None:
@@ -235,8 +247,7 @@ else:
                             st.markdown(
                                 f"**Source {i}** (`{source}`)\n\n{doc.page_content[:600]}..."
                             )
-
             except Exception as e:
                 st.error(f"Error during generation: {str(e)}")
 
-st.caption("Built with LangChain + OpenAI + Pinecone • Index: chatwithpdf")
+st.caption("Built with LangChain + OpenAI + Pinecone • Index: chatwithpdf-1536")
