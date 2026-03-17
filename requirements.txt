@@ -1,12 +1,23 @@
-streamlit==1.45.0
+# Force compatible pip tools to avoid notice + loop issues
+pip==26.0.1
+setuptools==75.1.0
+wheel==0.44.0
+
+# Core
+streamlit>=1.38.0          # recent enough → allows numpy 2.x
+python-dotenv>=1.0.1
+
+# LangChain packages (pinned lower to avoid newest langsmith → zstandard)
 langchain==0.3.0
-langchain-community==0.3.0
 langchain-core==0.3.0
 langchain-openai==0.2.0
-langchain-pinecone==0.2.0
+langchain-community==0.3.0
 langchain-text-splitters==0.3.0
-openai==1.50.0
-pinecone-client==3.2.2
-pypdf==4.3.1
-python-dotenv==1.0.1
-tiktoken==0.7.0
+
+# Pinecone
+langchain-pinecone==0.2.0
+pinecone==5.3.1            # or latest ~5.x
+
+# PDF & tokenizer
+pypdf>=5.0.0
+tiktoken>=0.7.0
