@@ -135,6 +135,7 @@ if st.session_state.vectorstore is None:
             st.stop()
 
 # ── RAG chain ────────────────────────────────────────────────────────────
+# ── RAG chain ────────────────────────────────────────────────────────────
 retriever = None
 conversational_rag_chain = None
 
@@ -143,7 +144,7 @@ if st.session_state.vectorstore:
 
     contextualize_q_prompt = ChatPromptTemplate.from_messages([
         ("system", "Given a chat history and the latest user question, formulate a standalone question that can be understood without the chat history. Do NOT answer it."),
-        MessagesPlaceholder("chat_history"),
+        ("user", "{chat_history}"),  # replaced MessagesPlaceholder
         ("human", "{input}"),
     ])
 
@@ -152,16 +153,14 @@ if st.session_state.vectorstore:
     )
 
     system_prompt = (
-        "You are a helpful, precise assistant answering questions based ONLY on the provided context.\n"
-        "If the context does not contain enough information, reply with:\n"
-        "\"Sorry, I don't have enough information in the documents to answer this accurately.\"\n"
-        "Never make up answers. Be concise and natural.\n\n"
-        "Context:\n{context}"
-    )
-
+    "You are a helpful assistant answering questions based ONLY on the provided context.\n"
+    "Summarize and explain the answer based on the context provided.\n"
+    "If the context is partial, answer as best you can, but indicate if something is missing.\n\n"
+    "Context:\n{context}"
+    ) 
     qa_prompt = ChatPromptTemplate.from_messages([
         ("system", system_prompt),
-        MessagesPlaceholder("chat_history"),
+        ("user", "{chat_history}"),  # replaced MessagesPlaceholder
         ("human", "{input}"),
     ])
 
@@ -180,6 +179,9 @@ if st.session_state.vectorstore:
         history_messages_key="chat_history",
         output_messages_key="answer",
     )
+
+
+
 
 # ── Chat interface ───────────────────────────────────────────────────────
 if conversational_rag_chain is None:
