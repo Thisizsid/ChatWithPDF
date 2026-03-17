@@ -1,138 +1,233 @@
-
 import streamlit as st
-from langchain.chains import create_history_aware_retriever, create_retrieval_chain
-from langchain.chains.combine_documents import create_stuff_documents_chain
+import os
+from dotenv import load_dotenv
+
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_chroma import Chroma
 from langchain_community.chat_message_histories import ChatMessageHistory
+from langchain_community.document_loaders import PyPDFLoader
 from langchain_core.chat_history import BaseChatMessageHistory
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_groq import ChatGroq
-from langchain_openai import OpenAIEmbeddings
 from langchain_core.runnables.history import RunnableWithMessageHistory
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.document_loaders import PyPDFLoader
-import os
+from langchain.chains import create_retrieval_chain, create_history_aware_retriever
+from langchain.chains.combine_documents import create_stuff_documents_chain
 
-from dotenv import load_dotenv
 load_dotenv()
 
-os.environ['HF_TOKEN'] = "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"
+PERSIST_DIRECTORY = "./chroma_db"
+st.set_page_config(page_title="PDF RAG Chat", page_icon="📄", layout="centered")
+st.title("📄 PDF Chat with OpenAI (Persistent RAG)")
+st.caption("Upload PDFs → Ask questions. Knowledge survives app restarts (local only).")
 
-# os.environ['HF_TOKEN']= 
-embeddings=HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-# embeddings = OpenAIEmbeddings()
+openai_api_key = os.getenv("OPENAI_API_KEY")
+if not openai_api_key:
+    st.error("❌ OPENAI_API_KEY not found in .env")
+    st.stop()
 
+@st.cache_resource(show_spinner="Loading embedding model...")
+def get_embeddings():
+    return OpenAIEmbeddings(model="text-embedding-3-small")
 
+embeddings = get_embeddings()
 
-st.title("PDF uploads and chat history")
-st.write("Upload Pdf's and chat with their content")
+llm = ChatOpenAI(
+    model="gpt-4o-mini",
+    temperature=0.0,
+    api_key=openai_api_key,
+    streaming=True   # ✅ Enable streaming on the LLM
+)
 
-## Input the Groq API Key
-api_key=st.text_input("Enter your Groq API key:",type="password")
+if "vectorstore" not in st.session_state:
+    st.session_state.vectorstore = None
+if "processed_files" not in st.session_state:
+    st.session_state.processed_files = set()
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "store" not in st.session_state:
+    st.session_state.store = {}
 
-## Check if groq api key is provided
-if api_key:
-    llm=ChatGroq(groq_api_key=api_key,model_name="Gemma2-9b-It")
+session_id = st.text_input("Session ID (for conversation memory)", value="default_session")
 
+with st.sidebar:
+    st.header("Controls")
+    if st.button("🗑️ Clear Chat History", use_container_width=True):
+        st.session_state.messages.clear()
+        if session_id in st.session_state.store:
+            st.session_state.store[session_id].clear()
+        st.rerun()
 
-    session_id=st.text_input("Session ID",value="default_session")
-    ## managing chat history
+    if st.session_state.vectorstore:
+        try:
+            count = st.session_state.vectorstore._collection.count()
+            st.caption(f"📊 **{count}** document chunks in knowledge base")
+        except:
+            st.caption("📊 Vector store loaded (count unavailable)")
 
-    if 'store' not in st.session_state:
-        st.session_state.store={}
+uploaded_files = st.file_uploader(
+    "Upload PDF(s)",
+    type="pdf",
+    accept_multiple_files=True,
+    help="Already processed files are skipped on subsequent runs."
+)
 
-    uploaded_files=st.file_uploader("Choose A PDf file",type="pdf",accept_multiple_files=True)
-    ## Process uploaded  PDF's
-    if uploaded_files:
-        documents=[]
-        for uploaded_file in uploaded_files:
-            temppdf=f"./temp.pdf"
-            with open(temppdf,"wb") as file:
-                file.write(uploaded_file.getvalue())
-                file_name=uploaded_file.name
+if uploaded_files:
+    with st.status("Processing PDFs...", expanded=True) as status:
+        new_documents = []
 
-            loader=PyPDFLoader(temppdf)
-            docs=loader.load()
-            documents.extend(docs)
+        for file in uploaded_files:
+            if file.name in st.session_state.processed_files:
+                status.write(f"✅ {file.name} already processed")
+                continue
 
-    # Split and create embeddings for the documents
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=5000, chunk_overlap=500)
-        splits = text_splitter.split_documents(documents)
-        vectorstore = Chroma.from_documents(documents=splits, embedding=embeddings)
-        retriever = vectorstore.as_retriever()    
+            temp_path = f"./temp_{file.name}"
+            with open(temp_path, "wb") as f:
+                f.write(file.getvalue())
 
-        contextualize_q_system_prompt=(
-            "Given a chat history and the latest user question"
-            "which might reference context in the chat history, "
-            "formulate a standalone question which can be understood "
-            "without the chat history. Do NOT answer the question, "
-            "just reformulate it if needed and otherwise return it as is."
+            try:
+                loader = PyPDFLoader(temp_path)
+                docs = loader.load()
+                new_documents.extend(docs)
+                st.session_state.processed_files.add(file.name)
+                status.write(f"✅ Loaded: {file.name} ({len(docs)} pages)")
+            except Exception as e:
+                status.error(f"Failed {file.name}: {e}")
+            finally:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+
+        if new_documents:
+            status.write("Splitting into chunks...")
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=1000,
+                chunk_overlap=200,
+                separators=["\n\n", "\n", ". ", " ", ""]
+            )
+            splits = text_splitter.split_documents(new_documents)
+
+            status.write("Adding to vector database...")
+            if st.session_state.vectorstore is None:
+                st.session_state.vectorstore = Chroma.from_documents(
+                    documents=splits,
+                    embedding=embeddings,
+                    persist_directory=PERSIST_DIRECTORY,
+                    collection_name="pdf_rag"
+                )
+            else:
+                st.session_state.vectorstore.add_documents(splits)
+
+            status.update(label=f"✅ Added {len(splits)} new chunks!", state="complete")
+        else:
+            status.update(label="No new documents to process", state="complete")
+
+if st.session_state.vectorstore is None and os.path.exists(PERSIST_DIRECTORY):
+    with st.spinner("Loading existing knowledge base from disk..."):
+        st.session_state.vectorstore = Chroma(
+            persist_directory=PERSIST_DIRECTORY,
+            embedding_function=embeddings,
+            collection_name="pdf_rag"
         )
-        contextualize_q_prompt = ChatPromptTemplate.from_messages(
-                [
-                    ("system", contextualize_q_system_prompt),
-                    MessagesPlaceholder("chat_history"),
-                    ("human", "{input}"),
-                ]
-            )
-        
-        history_aware_retriever=create_history_aware_retriever(llm,retriever,contextualize_q_prompt)
+    st.success("Loaded saved knowledge base", icon="📂")
 
-     
-        system_prompt = (
-                "You are an assistant for question-answering tasks. "
-                "Use the following pieces of retrieved context to answer "
-                "the question. If you don't know the answer, say that you "
-                "don't know. Use three sentences maximum and keep the "
-                "answer concise."
-                "\n\n"
-                "{context}"
-            )
-        qa_prompt = ChatPromptTemplate.from_messages(
-                [
-                    ("system", system_prompt),
-                    MessagesPlaceholder("chat_history"),
-                    ("human", "{input}"),
-                ]
-            )
-        
-        question_answer_chain=create_stuff_documents_chain(llm,qa_prompt)
-        rag_chain=create_retrieval_chain(history_aware_retriever,question_answer_chain)
+retriever = None
+conversational_rag_chain = None
 
-        def get_session_history(session:str)->BaseChatMessageHistory:
-            if session_id not in st.session_state.store:
-                st.session_state.store[session_id]=ChatMessageHistory()
-            return st.session_state.store[session_id]
-        
-        conversational_rag_chain=RunnableWithMessageHistory(
-            rag_chain,get_session_history,
-            input_messages_key="input",
-            history_messages_key="chat_history",
-            output_messages_key="answer"
-        )
+if st.session_state.vectorstore:
+    retriever = st.session_state.vectorstore.as_retriever(search_kwargs={"k": 6})
 
-        user_input = st.text_input("Your question:")
-        if user_input:
-            session_history=get_session_history(session_id)
-            response = conversational_rag_chain.invoke(
-                {"input": user_input},
-                config={
-                    "configurable": {"session_id":session_id}
-                }, 
-            )
-            st.write(st.session_state.store)
-            st.write("Assistant:", response['answer'])
-            st.write("Chat History:", session_history.messages)
+    contextualize_q_prompt = ChatPromptTemplate.from_messages([
+        ("system",
+         "Given a chat history and the latest user question, "
+         "formulate a standalone question that can be understood "
+         "without the chat history. Do NOT answer it."),
+        MessagesPlaceholder("chat_history"),
+        ("human", "{input}"),
+    ])
+
+    history_aware_retriever = create_history_aware_retriever(
+        llm, retriever, contextualize_q_prompt
+    )
+
+    system_prompt = (
+        "You are a helpful, precise assistant answering questions based ONLY on the provided context.\n"
+        "If the context does not contain enough information, reply with:\n"
+        "\"Sorry, I don't have enough information in the documents to answer this accurately.\"\n"
+        "Never make up answers. Be concise and natural.\n\n"
+        "Context:\n{context}"
+    )
+
+    qa_prompt = ChatPromptTemplate.from_messages([
+        ("system", system_prompt),
+        MessagesPlaceholder("chat_history"),
+        ("human", "{input}"),
+    ])
+
+    question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
+    rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
+
+    def get_session_history(session: str) -> BaseChatMessageHistory:
+        if session not in st.session_state.store:
+            st.session_state.store[session] = ChatMessageHistory()
+        return st.session_state.store[session]
+
+    conversational_rag_chain = RunnableWithMessageHistory(
+        rag_chain,
+        get_session_history,
+        input_messages_key="input",
+        history_messages_key="chat_history",
+        output_messages_key="answer",
+    )
+
+# ====================== CHAT INTERFACE ======================
+if conversational_rag_chain is None:
+    st.info("👆 Upload at least one PDF to start chatting.")
 else:
-    st.warning("Please enter the Groq API Key")
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
 
+    if prompt := st.chat_input("Ask anything about the uploaded PDFs..."):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
 
+        with st.chat_message("assistant"):
+            # ✅ Stream tokens using a generator fed into st.write_stream
+            def stream_response():
+                full_response = ""
+                context_docs = []
 
+                for chunk in conversational_rag_chain.stream(
+                    {"input": prompt},
+                    config={"configurable": {"session_id": session_id}}
+                ):
+                    # Capture context docs when they arrive
+                    if "context" in chunk and chunk["context"]:
+                        context_docs = chunk["context"]
 
+                    # Yield answer tokens as they stream in
+                    if "answer" in chunk and chunk["answer"]:
+                        full_response += chunk["answer"]
+                        yield chunk["answer"]
 
+                # Store final answer and context in session state after streaming
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": full_response
+                })
+                st.session_state["last_context"] = context_docs
 
+            try:
+                st.write_stream(stream_response())
 
+                # Show retrieved passages after streaming completes
+                if st.session_state.get("last_context"):
+                    with st.expander("📚 Retrieved passages"):
+                        for i, doc in enumerate(st.session_state["last_context"], 1):
+                            source = doc.metadata.get("source", "Unknown")
+                            st.markdown(f"**Source {i}** (`{source}`)\n\n{doc.page_content[:600]}...")
 
+            except Exception as e:
+                st.error(f"Error during generation: {str(e)}")
 
-
+st.caption("Built with LangChain + OpenAI + Chroma • Knowledge persists in `./chroma_db`")
