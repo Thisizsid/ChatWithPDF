@@ -3,26 +3,34 @@ import os
 from dotenv import load_dotenv
 
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_chroma import Chroma
+from langchain_pinecone import PineconeVectorStore
+
 from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_core.chat_history import BaseChatMessageHistory
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain.chains import create_retrieval_chain, create_history_aware_retriever
+from langchain.chains import create_retrieval_chain
 from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain.chains.history_aware_retriever import create_history_aware_retriever
 
 load_dotenv()
 
-PERSIST_DIRECTORY = "./chroma_db"
 st.set_page_config(page_title="PDF RAG Chat", page_icon="📄", layout="centered")
-st.title("📄 PDF Chat with OpenAI (Persistent RAG)")
-st.caption("Upload PDFs → Ask questions. Knowledge survives app restarts (local only).")
+st.title("📄 PDF Chat with OpenAI + Pinecone")
+st.caption("Upload PDFs → Ask questions. Knowledge stored in Pinecone index 'chatwithpdf'")
 
+# ── Check required environment variables ───────────────────────────────
 openai_api_key = os.getenv("OPENAI_API_KEY")
+pinecone_api_key = os.getenv("PINECONE_API_KEY")  # must exist for Pinecone to work
+
 if not openai_api_key:
     st.error("❌ OPENAI_API_KEY not found in .env")
+    st.stop()
+
+if not pinecone_api_key:
+    st.error("❌ PINECONE_API_KEY not found in .env")
     st.stop()
 
 @st.cache_resource(show_spinner="Loading embedding model...")
@@ -35,13 +43,12 @@ llm = ChatOpenAI(
     model="gpt-4o-mini",
     temperature=0.0,
     api_key=openai_api_key,
-    streaming=True   # ✅ Enable streaming on the LLM
+    streaming=True
 )
 
+# Session state
 if "vectorstore" not in st.session_state:
     st.session_state.vectorstore = None
-if "processed_files" not in st.session_state:
-    st.session_state.processed_files = set()
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "store" not in st.session_state:
@@ -58,28 +65,22 @@ with st.sidebar:
         st.rerun()
 
     if st.session_state.vectorstore:
-        try:
-            count = st.session_state.vectorstore._collection.count()
-            st.caption(f"📊 **{count}** document chunks in knowledge base")
-        except:
-            st.caption("📊 Vector store loaded (count unavailable)")
+        st.caption("📊 Using Pinecone index: chatwithpdf")
 
 uploaded_files = st.file_uploader(
     "Upload PDF(s)",
     type="pdf",
     accept_multiple_files=True,
-    help="Already processed files are skipped on subsequent runs."
+    help="Files will be added to your Pinecone index 'chatwithpdf'"
 )
 
+INDEX_NAME = "chatwithpdf-1536"
+
 if uploaded_files:
-    with st.status("Processing PDFs...", expanded=True) as status:
+    with st.status("Processing PDFs and upserting to Pinecone...", expanded=True) as status:
         new_documents = []
 
         for file in uploaded_files:
-            if file.name in st.session_state.processed_files:
-                status.write(f"✅ {file.name} already processed")
-                continue
-
             temp_path = f"./temp_{file.name}"
             with open(temp_path, "wb") as f:
                 f.write(file.getvalue())
@@ -88,7 +89,6 @@ if uploaded_files:
                 loader = PyPDFLoader(temp_path)
                 docs = loader.load()
                 new_documents.extend(docs)
-                st.session_state.processed_files.add(file.name)
                 status.write(f"✅ Loaded: {file.name} ({len(docs)} pages)")
             except Exception as e:
                 status.error(f"Failed {file.name}: {e}")
@@ -105,30 +105,36 @@ if uploaded_files:
             )
             splits = text_splitter.split_documents(new_documents)
 
-            status.write("Adding to vector database...")
+            status.write("Upserting to Pinecone index 'chatwithpdf'...")
             if st.session_state.vectorstore is None:
-                st.session_state.vectorstore = Chroma.from_documents(
+                # First time: create from documents
+                st.session_state.vectorstore = PineconeVectorStore.from_documents(
                     documents=splits,
                     embedding=embeddings,
-                    persist_directory=PERSIST_DIRECTORY,
-                    collection_name="pdf_rag"
+                    index_name=INDEX_NAME
                 )
             else:
+                # Add more documents to existing index
                 st.session_state.vectorstore.add_documents(splits)
 
-            status.update(label=f"✅ Added {len(splits)} new chunks!", state="complete")
+            status.update(label=f"✅ Upserted {len(splits)} chunks to Pinecone!", state="complete")
         else:
             status.update(label="No new documents to process", state="complete")
 
-if st.session_state.vectorstore is None and os.path.exists(PERSIST_DIRECTORY):
-    with st.spinner("Loading existing knowledge base from disk..."):
-        st.session_state.vectorstore = Chroma(
-            persist_directory=PERSIST_DIRECTORY,
-            embedding_function=embeddings,
-            collection_name="pdf_rag"
-        )
-    st.success("Loaded saved knowledge base", icon="📂")
+# Try to connect to existing index if not already loaded
+if st.session_state.vectorstore is None:
+    with st.spinner("Connecting to existing Pinecone index 'chatwithpdf'..."):
+        try:
+            st.session_state.vectorstore = PineconeVectorStore.from_existing_index(
+                index_name=INDEX_NAME,
+                embedding=embeddings
+            )
+            st.success("Connected to Pinecone index", icon="✅")
+        except Exception as e:
+            st.error(f"Could not connect to Pinecone index: {str(e)}")
+            st.stop()
 
+# ── RAG chain ────────────────────────────────────────────────────────────
 retriever = None
 conversational_rag_chain = None
 
@@ -136,10 +142,7 @@ if st.session_state.vectorstore:
     retriever = st.session_state.vectorstore.as_retriever(search_kwargs={"k": 6})
 
     contextualize_q_prompt = ChatPromptTemplate.from_messages([
-        ("system",
-         "Given a chat history and the latest user question, "
-         "formulate a standalone question that can be understood "
-         "without the chat history. Do NOT answer it."),
+        ("system", "Given a chat history and the latest user question, formulate a standalone question that can be understood without the chat history. Do NOT answer it."),
         MessagesPlaceholder("chat_history"),
         ("human", "{input}"),
     ])
@@ -178,9 +181,9 @@ if st.session_state.vectorstore:
         output_messages_key="answer",
     )
 
-# ====================== CHAT INTERFACE ======================
+# ── Chat interface ───────────────────────────────────────────────────────
 if conversational_rag_chain is None:
-    st.info("👆 Upload at least one PDF to start chatting.")
+    st.info("👆 Upload at least one PDF to start chatting (or wait while connecting to Pinecone).")
 else:
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
@@ -192,7 +195,6 @@ else:
             st.markdown(prompt)
 
         with st.chat_message("assistant"):
-            # ✅ Stream tokens using a generator fed into st.write_stream
             def stream_response():
                 full_response = ""
                 context_docs = []
@@ -201,26 +203,18 @@ else:
                     {"input": prompt},
                     config={"configurable": {"session_id": session_id}}
                 ):
-                    # Capture context docs when they arrive
                     if "context" in chunk and chunk["context"]:
                         context_docs = chunk["context"]
-
-                    # Yield answer tokens as they stream in
                     if "answer" in chunk and chunk["answer"]:
                         full_response += chunk["answer"]
                         yield chunk["answer"]
 
-                # Store final answer and context in session state after streaming
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": full_response
-                })
+                st.session_state.messages.append({"role": "assistant", "content": full_response})
                 st.session_state["last_context"] = context_docs
 
             try:
                 st.write_stream(stream_response())
 
-                # Show retrieved passages after streaming completes
                 if st.session_state.get("last_context"):
                     with st.expander("📚 Retrieved passages"):
                         for i, doc in enumerate(st.session_state["last_context"], 1):
@@ -230,4 +224,4 @@ else:
             except Exception as e:
                 st.error(f"Error during generation: {str(e)}")
 
-st.caption("Built with LangChain + OpenAI + Chroma • Knowledge persists in `./chroma_db`")
+st.caption("Built with LangChain + OpenAI + Pinecone • Index: chatwithpdf")

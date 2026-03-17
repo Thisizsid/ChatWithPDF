@@ -15,7 +15,8 @@ langchain-chroma==0.2.4
 openai>=1.30.0
 
 # Vector DB
-chromadb>=0.5.0
+langchain-pinecone
+pinecone
 
 # PDF loading
 pypdf>=4.0.0
