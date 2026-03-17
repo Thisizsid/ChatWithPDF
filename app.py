@@ -23,19 +23,21 @@ st.caption("Upload PDFs → Ask questions. Knowledge stored in Pinecone index 'c
 
 # ── Check required environment variables ───────────────────────────────
 openai_api_key = os.getenv("OPENAI_API_KEY")
-pinecone_api_key = os.getenv("PINECONE_API_KEY")  # must exist for Pinecone to work
+pinecone_api_key = os.getenv("PINECONE_API_KEY")
 
 if not openai_api_key:
-    st.error("❌ OPENAI_API_KEY not found in .env")
+    st.error("❌ OPENAI_API_KEY not found in .env or Streamlit secrets")
     st.stop()
 
 if not pinecone_api_key:
-    st.error("❌ PINECONE_API_KEY not found in .env")
+    st.error("❌ PINECONE_API_KEY not found in .env or Streamlit secrets")
     st.stop()
+
 
 @st.cache_resource(show_spinner="Loading embedding model...")
 def get_embeddings():
     return OpenAIEmbeddings(model="text-embedding-3-small")
+
 
 embeddings = get_embeddings()
 
@@ -43,10 +45,10 @@ llm = ChatOpenAI(
     model="gpt-4o-mini",
     temperature=0.0,
     api_key=openai_api_key,
-    streaming=True
+    streaming=True,
 )
 
-# Session state
+# ── Session state ────────────────────────────────────────────────────────
 if "vectorstore" not in st.session_state:
     st.session_state.vectorstore = None
 if "messages" not in st.session_state:
@@ -56,6 +58,7 @@ if "store" not in st.session_state:
 
 session_id = st.text_input("Session ID (for conversation memory)", value="default_session")
 
+# ── Sidebar ──────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("Controls")
     if st.button("🗑️ Clear Chat History", use_container_width=True):
@@ -67,11 +70,12 @@ with st.sidebar:
     if st.session_state.vectorstore:
         st.caption("📊 Using Pinecone index: chatwithpdf")
 
+# ── PDF Upload ───────────────────────────────────────────────────────────
 uploaded_files = st.file_uploader(
     "Upload PDF(s)",
     type="pdf",
     accept_multiple_files=True,
-    help="Files will be added to your Pinecone index 'chatwithpdf'"
+    help="Files will be added to your Pinecone index 'chatwithpdf'",
 )
 
 INDEX_NAME = "chatwithpdf-1536"
@@ -101,33 +105,34 @@ if uploaded_files:
             text_splitter = RecursiveCharacterTextSplitter(
                 chunk_size=1000,
                 chunk_overlap=200,
-                separators=["\n\n", "\n", ". ", " ", ""]
+                separators=["\n\n", "\n", ". ", " ", ""],
             )
             splits = text_splitter.split_documents(new_documents)
 
-            status.write("Upserting to Pinecone index 'chatwithpdf'...")
+            status.write("Upserting to Pinecone index...")
             if st.session_state.vectorstore is None:
-                # First time: create from documents
                 st.session_state.vectorstore = PineconeVectorStore.from_documents(
                     documents=splits,
                     embedding=embeddings,
-                    index_name=INDEX_NAME
+                    index_name=INDEX_NAME,
                 )
             else:
-                # Add more documents to existing index
                 st.session_state.vectorstore.add_documents(splits)
 
-            status.update(label=f"✅ Upserted {len(splits)} chunks to Pinecone!", state="complete")
+            status.update(
+                label=f"✅ Upserted {len(splits)} chunks to Pinecone!",
+                state="complete",
+            )
         else:
             status.update(label="No new documents to process", state="complete")
 
-# Try to connect to existing index if not already loaded
+# ── Connect to existing Pinecone index if not loaded yet ─────────────────
 if st.session_state.vectorstore is None:
-    with st.spinner("Connecting to existing Pinecone index 'chatwithpdf'..."):
+    with st.spinner("Connecting to existing Pinecone index..."):
         try:
             st.session_state.vectorstore = PineconeVectorStore.from_existing_index(
                 index_name=INDEX_NAME,
-                embedding=embeddings
+                embedding=embeddings,
             )
             st.success("Connected to Pinecone index", icon="✅")
         except Exception as e:
@@ -135,16 +140,22 @@ if st.session_state.vectorstore is None:
             st.stop()
 
 # ── RAG chain ────────────────────────────────────────────────────────────
-# ── RAG chain ────────────────────────────────────────────────────────────
 retriever = None
 conversational_rag_chain = None
 
 if st.session_state.vectorstore:
     retriever = st.session_state.vectorstore.as_retriever(search_kwargs={"k": 6})
 
+    # FIX: Use MessagesPlaceholder instead of ("user", "{chat_history}") tuple.
+    # The tuple form passes the raw history object as a string which resolves to
+    # None under newer LangChain / Pydantic versions, crashing create_stuff_documents_chain.
     contextualize_q_prompt = ChatPromptTemplate.from_messages([
-        ("system", "Given a chat history and the latest user question, formulate a standalone question that can be understood without the chat history. Do NOT answer it."),
-        ("user", "{chat_history}"),  # replaced MessagesPlaceholder
+        (
+            "system",
+            "Given a chat history and the latest user question, formulate a standalone "
+            "question that can be understood without the chat history. Do NOT answer it.",
+        ),
+        MessagesPlaceholder("chat_history"),  # ← fixed
         ("human", "{input}"),
     ])
 
@@ -153,14 +164,15 @@ if st.session_state.vectorstore:
     )
 
     system_prompt = (
-    "You are a helpful assistant answering questions based ONLY on the provided context.\n"
-    "Summarize and explain the answer based on the context provided.\n"
-    "If the context is partial, answer as best you can, but indicate if something is missing.\n\n"
-    "Context:\n{context}"
-    ) 
+        "You are a helpful assistant answering questions based ONLY on the provided context.\n"
+        "Summarize and explain the answer based on the context provided.\n"
+        "If the context is partial, answer as best you can, but indicate if something is missing.\n\n"
+        "Context:\n{context}"
+    )
+
     qa_prompt = ChatPromptTemplate.from_messages([
         ("system", system_prompt),
-        ("user", "{chat_history}"),  # replaced MessagesPlaceholder
+        MessagesPlaceholder("chat_history"),  # ← fixed
         ("human", "{input}"),
     ])
 
@@ -179,9 +191,6 @@ if st.session_state.vectorstore:
         history_messages_key="chat_history",
         output_messages_key="answer",
     )
-
-
-
 
 # ── Chat interface ───────────────────────────────────────────────────────
 if conversational_rag_chain is None:
@@ -203,7 +212,7 @@ else:
 
                 for chunk in conversational_rag_chain.stream(
                     {"input": prompt},
-                    config={"configurable": {"session_id": session_id}}
+                    config={"configurable": {"session_id": session_id}},
                 ):
                     if "context" in chunk and chunk["context"]:
                         context_docs = chunk["context"]
@@ -211,7 +220,9 @@ else:
                         full_response += chunk["answer"]
                         yield chunk["answer"]
 
-                st.session_state.messages.append({"role": "assistant", "content": full_response})
+                st.session_state.messages.append(
+                    {"role": "assistant", "content": full_response}
+                )
                 st.session_state["last_context"] = context_docs
 
             try:
@@ -221,7 +232,9 @@ else:
                     with st.expander("📚 Retrieved passages"):
                         for i, doc in enumerate(st.session_state["last_context"], 1):
                             source = doc.metadata.get("source", "Unknown")
-                            st.markdown(f"**Source {i}** (`{source}`)\n\n{doc.page_content[:600]}...")
+                            st.markdown(
+                                f"**Source {i}** (`{source}`)\n\n{doc.page_content[:600]}..."
+                            )
 
             except Exception as e:
                 st.error(f"Error during generation: {str(e)}")
